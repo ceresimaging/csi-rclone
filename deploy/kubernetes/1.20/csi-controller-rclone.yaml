@@ -47,7 +47,7 @@ spec:
             - name: socket-dir
               mountPath: /plugin
         - name: rclone
-          image: ghcr.io/ceresimaging/csi-rclone:master
+          image: ghcr.io/ceresimaging/csi-rclone:v3.0.1
           args :
             - "/bin/csi-rclone-plugin"
             - "--nodeid=$(NODE_ID)"
