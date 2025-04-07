@@ -47,7 +47,7 @@ spec:
             - name: socket-dir
               mountPath: /plugin
         - name: rclone
-          image: ghcr.io/ceresimaging/ceres-flights-csi-rclone:v3.0.1
+          image: ghcr.io/ceresimaging/csi-rclone:master
           args :
             - "/bin/csi-rclone-plugin"
             - "--nodeid=$(NODE_ID)"
