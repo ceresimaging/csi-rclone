@@ -9,18 +9,39 @@ RUN make plugin
 FROM alpine:3.16
 RUN apk add --no-cache ca-certificates bash fuse3 curl unzip tini
 
-# To install the latest version: v1.68 seems to be broken
+# To install the latest version when building: v1.68 seems to be broken
 # RUN curl https://rclone.org/install.sh | bash
 
 # Hard-coding to the latest 1.67 version
 # https://rclone.org/install/#linux
 # https://rclone.org/downloads/#older-downloads
 
-# Set up platform detection
+ARG RCLONE_VERSION="v1.67.0"
+ARG OS="linux"
+ARG OS_type="amd64"
+
+# Platform detection copied from https://rclone.org/install.sh
 RUN OS="$(uname)" && \
     case $OS in \
       Linux) \
         OS='linux' \
+        ;; \
+      FreeBSD) \
+        OS='freebsd' \
+        ;; \
+      NetBSD) \
+        OS='netbsd' \
+        ;; \
+      OpenBSD) \
+        OS='openbsd' \
+        ;; \
+      Darwin) \
+        OS='osx' \
+        ;; \
+      SunOS) \
+        OS='solaris' \
+        echo 'OS not supported' \
+        exit 2 \
         ;; \
       *) \
         echo 'OS not supported' \
@@ -52,9 +73,9 @@ RUN OS="$(uname)" && \
         exit 2 \
         ;; \
     esac && \
-    curl -OfsS "https://downloads.rclone.org/v1.67.0/rclone-v1.67.0-${OS}-${OS_type}.zip" && \
-    unzip "rclone-v1.67.0-${OS}-${OS_type}.zip" && \
-    cd "rclone-v1.67.0-${OS}-${OS_type}" && \
+    curl -OfsS "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-${OS}-${OS_type}.zip" && \
+    unzip "rclone-${RCLONE_VERSION}-${OS}-${OS_type}.zip" && \
+    cd "rclone-${RCLONE_VERSION}-${OS}-${OS_type}" && \
     cp rclone /usr/bin/ && \
     chown root:root /usr/bin/rclone && \
     chmod 755 /usr/bin/rclone
