@@ -106,6 +106,12 @@ Current code is referencing projects repository on github.com. If you fork the r
 make build
 ```
 
+If you're using a different repository/image name, you can change the `IMAGE` variable in `Makefile`. 
+
+```
+make build push REGISTRY_NAME=<REGISTRY_URL> IMAGE_NAME=<path>/<name>
+```
+
 3. Change docker.io account in `Makefile` and use `make push` to push the image to remote. 
 ``` 
 make push
