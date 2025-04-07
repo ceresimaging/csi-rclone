@@ -1,6 +1,6 @@
 ---
 # Multiarch build file credits go to Lars Kellogg-Stedman at blog.oddbit.com. If You ever see this - thanks!
-name: 'build images'
+name: Build and publish images
 
 on:
   push:
