@@ -2,4 +2,3 @@ _output/
 .vscode
 rclone-build/
 .idea
-build.sh
