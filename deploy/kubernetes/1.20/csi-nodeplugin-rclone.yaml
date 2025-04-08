@@ -38,6 +38,13 @@ spec:
               mountPath: /plugin
             - name: registration-dir
               mountPath: /registration
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "0.5Gi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
         - name: rclone
           securityContext:
             privileged: true
@@ -68,6 +75,13 @@ spec:
             - name: pods-mount-dir
               mountPath: /var/lib/kubelet/pods
               mountPropagation: "Bidirectional"
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "16Gi"
       volumes:
         - name: plugin-dir
           hostPath:
@@ -81,3 +95,8 @@ spec:
             path: /var/lib/kubelet/plugins_registry
             type: DirectoryOrCreate
           name: registration-dir
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
