@@ -3,6 +3,7 @@ package rclone
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
@@ -242,6 +244,11 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	rcPort := mountContext.rcPort
 
 	if rcPort != 0 {
+	    // Try to delete the service
+        if err := deleteRcloneService(targetPath); err != nil {
+            glog.Warningf("Failed to delete rclone service: %v", err)
+            // Continue even if service deletion fails
+        }
 		// Connect to rclone rpc server and query the operation status
 		// If the rclone process is still running, wait for it to finish cache sync
 		// If the rclone process is not running, proceed to volume unmount
@@ -372,7 +379,7 @@ func flagToEnvName(flag string) string {
 // Credit: https://gist.github.com/sevkin/96bdae9274465b2d09191384f86ef39d
 func getFreePort() (port int, err error) {
 	var a *net.TCPAddr
-	if a, err = net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
+	if a, err = net.ResolveTCPAddr("tcp", "0.0.0.0:0"); err == nil {
 		var l *net.TCPListener
 		if l, err = net.ListenTCP("tcp", a); err == nil {
 			defer l.Close()
@@ -416,7 +423,7 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		remoteWithPath,
 		targetPath,
 		"--rc",
-		"--rc-addr="+fmt.Sprintf("localhost:%d", rcPort),
+        "--rc-addr=0.0.0.0:"+strconv.Itoa(rcPort),
 		"--daemon",
 		"--daemon-wait=0",
 	)
@@ -432,7 +439,7 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		}
 
 		// Normally, a defer os.Remove(configFile.Name()) should be placed here.
-		// However, due to a rclone mount --daemon flag, rclone forks and creates a race condition
+		// However, due to a rclone mount --daemon flalg, rclone forks and creates a race condition
 		// with this nodeplugin proceess. As a result, the config file gets deleted
 		// before it's reread by a forked process.
 
@@ -479,7 +486,142 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 	if err != nil {
 		return 0, fmt.Errorf("mounting failed: %v cmd: '%s' remote: '%s' targetpath: %s output: %q",
 			err, mountCmd, remoteWithPath, targetPath, string(out))
-	}
+	} else {
+        // Create a Kubernetes service to expose the rclone RC server
+        if err = createRcloneService(targetPath, rcPort); err != nil {
+            glog.Warningf("Failed to create service for rclone RC: %v", err)
+            // Continue even if service creation fails - it's not critical for mounting
+        }
+    }
 
 	return rcPort, nil
+}
+
+func createRcloneService(targetPath string, port int) error {
+    // Get the node name from environment
+    nodeName := os.Getenv("NODE_NAME")
+    if nodeName == "" {
+        return fmt.Errorf("NODE_NAME environment variable not set")
+    }
+
+    // Create a unique service name based on the node name and mount path
+    // Replace characters that aren't allowed in service names
+    cleanNodeName := strings.ReplaceAll(nodeName, ".", "-")
+    cleanPath := strings.ReplaceAll(
+        strings.TrimPrefix(targetPath, "/"),
+        "/", "-")
+
+    serviceName := fmt.Sprintf("rclone-%s-%s", cleanNodeName, cleanPath)
+
+    // Truncate to valid service name length and ensure it's lowercase
+    if len(serviceName) > 63 {
+        // Keep node name intact and truncate the path portion
+        nodePrefix := fmt.Sprintf("rclone-%s-", cleanNodeName)
+        pathMax := 63 - len(nodePrefix)
+        if pathMax > 0 {
+            serviceName = nodePrefix + cleanPath[:min(len(cleanPath), pathMax)]
+        } else {
+            // Very long node name case - use hash
+            h := fnv.New32a()
+            h.Write([]byte(targetPath))
+            serviceName = fmt.Sprintf("rclone-%s-%x", cleanNodeName[:50], h.Sum32())
+        }
+    }
+    serviceName = strings.ToLower(serviceName)
+
+    clientset, err := GetK8sClient()
+    if err != nil {
+        return err
+    }
+
+    // Create the service resource
+    service := &v1.Service{
+        ObjectMeta: metav1.ObjectMeta{
+            Name: serviceName,
+            Labels: map[string]string{
+                "app": "csi-rclone",
+                "component": "mount-service",
+            },
+        },
+        Spec: v1.ServiceSpec{
+            Ports: []v1.ServicePort{
+                {
+                    Name: "rclone-rc",
+                    Port: int32(port),
+                    TargetPort: intstr.FromInt(port),
+                },
+            },
+            Selector: map[string]string{
+                "kubernetes.io/hostname": nodeName,
+            },
+        },
+    }
+
+    kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+        clientcmd.NewDefaultClientConfigLoadingRules(),
+        &clientcmd.ConfigOverrides{},
+    )
+
+    namespace, _, err := kubeconfig.Namespace()
+    if err != nil {
+        return err
+    }
+
+    _, err = clientset.CoreV1().Services(namespace).Create(service)
+    if err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func deleteRcloneService(targetPath string) error {
+    nodeName := os.Getenv("NODE_NAME")
+    if nodeName == "" {
+        return fmt.Errorf("NODE_NAME environment variable not set")
+    }
+
+    cleanNodeName := strings.ReplaceAll(nodeName, ".", "-")
+    cleanPath := strings.ReplaceAll(
+        strings.TrimPrefix(targetPath, "/"),
+        "/", "-")
+
+    serviceName := fmt.Sprintf("rclone-%s-%s", cleanNodeName, cleanPath)
+
+    if len(serviceName) > 63 {
+        nodePrefix := fmt.Sprintf("rclone-%s-", cleanNodeName)
+        pathMax := 63 - len(nodePrefix)
+        if pathMax > 0 {
+            serviceName = nodePrefix + cleanPath[:min(len(cleanPath), pathMax)]
+        } else {
+            h := fnv.New32a()
+            h.Write([]byte(targetPath))
+            serviceName = fmt.Sprintf("rclone-%s-%x", cleanNodeName[:50], h.Sum32())
+        }
+    }
+    serviceName = strings.ToLower(serviceName)
+
+    clientset, err := GetK8sClient()
+    if err != nil {
+        return err
+    }
+
+    kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+        clientcmd.NewDefaultClientConfigLoadingRules(),
+        &clientcmd.ConfigOverrides{},
+    )
+
+    namespace, _, err := kubeconfig.Namespace()
+    if err != nil {
+        return err
+    }
+
+    return clientset.CoreV1().Services(namespace).Delete(serviceName, &metav1.DeleteOptions{})
+}
+
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
 }
