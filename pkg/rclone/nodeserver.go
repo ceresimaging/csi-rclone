@@ -3,7 +3,6 @@ package rclone
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -504,29 +503,15 @@ func createRcloneService(targetPath string, port int) error {
         return fmt.Errorf("NODE_NAME environment variable not set")
     }
 
-    // Create a unique service name based on the node name and mount path
-    // Replace characters that aren't allowed in service names
-    cleanNodeName := strings.ReplaceAll(nodeName, ".", "-")
-    cleanPath := strings.ReplaceAll(
-        strings.TrimPrefix(targetPath, "/"),
-        "/", "-")
-
-    serviceName := fmt.Sprintf("rclone-%s-%s", cleanNodeName, cleanPath)
-
-    // Truncate to valid service name length and ensure it's lowercase
-    if len(serviceName) > 63 {
-        // Keep node name intact and truncate the path portion
-        nodePrefix := fmt.Sprintf("rclone-%s-", cleanNodeName)
-        pathMax := 63 - len(nodePrefix)
-        if pathMax > 0 {
-            serviceName = nodePrefix + cleanPath[:min(len(cleanPath), pathMax)]
-        } else {
-            // Very long node name case - use hash
-            h := fnv.New32a()
-            h.Write([]byte(targetPath))
-            serviceName = fmt.Sprintf("rclone-%s-%x", cleanNodeName[:50], h.Sum32())
-        }
+    // Extract the Pod UUID from the path
+    // Path format: /var/lib/kubelet/pods/<UUID>/volumes/kubernetes.io~csi/<volume-name>/mount
+    podUUID := extractPodUUID(targetPath)
+    if podUUID == "" {
+        return fmt.Errorf("could not extract Pod UUID from path: %s", targetPath)
     }
+
+    serviceName := fmt.Sprintf("rclone-%s", podUUID)
+    // Ensure serviceName is valid
     serviceName = strings.ToLower(serviceName)
 
     clientset, err := GetK8sClient()
@@ -541,6 +526,7 @@ func createRcloneService(targetPath string, port int) error {
             Labels: map[string]string{
                 "app": "csi-rclone",
                 "component": "mount-service",
+                "pod-uuid": podUUID,
             },
         },
         Spec: v1.ServiceSpec{
@@ -576,29 +562,12 @@ func createRcloneService(targetPath string, port int) error {
 }
 
 func deleteRcloneService(targetPath string) error {
-    nodeName := os.Getenv("NODE_NAME")
-    if nodeName == "" {
-        return fmt.Errorf("NODE_NAME environment variable not set")
+    podUUID := extractPodUUID(targetPath)
+    if podUUID == "" {
+        return fmt.Errorf("could not extract Pod UUID from path: %s", targetPath)
     }
 
-    cleanNodeName := strings.ReplaceAll(nodeName, ".", "-")
-    cleanPath := strings.ReplaceAll(
-        strings.TrimPrefix(targetPath, "/"),
-        "/", "-")
-
-    serviceName := fmt.Sprintf("rclone-%s-%s", cleanNodeName, cleanPath)
-
-    if len(serviceName) > 63 {
-        nodePrefix := fmt.Sprintf("rclone-%s-", cleanNodeName)
-        pathMax := 63 - len(nodePrefix)
-        if pathMax > 0 {
-            serviceName = nodePrefix + cleanPath[:min(len(cleanPath), pathMax)]
-        } else {
-            h := fnv.New32a()
-            h.Write([]byte(targetPath))
-            serviceName = fmt.Sprintf("rclone-%s-%x", cleanNodeName[:50], h.Sum32())
-        }
-    }
+    serviceName := fmt.Sprintf("rclone-%s", podUUID)
     serviceName = strings.ToLower(serviceName)
 
     clientset, err := GetK8sClient()
@@ -619,9 +588,14 @@ func deleteRcloneService(targetPath string) error {
     return clientset.CoreV1().Services(namespace).Delete(serviceName, &metav1.DeleteOptions{})
 }
 
-func min(a, b int) int {
-    if a < b {
-        return a
+// extractPodUUID extracts the Pod UUID from the target path
+func extractPodUUID(targetPath string) string {
+    // Path format: /var/lib/kubelet/pods/<UUID>/volumes/kubernetes.io~csi/<volume-name>/mount
+    parts := strings.Split(targetPath, "/")
+    for i, part := range parts {
+        if part == "pods" && i+1 < len(parts) {
+            return parts[i+1]
+        }
     }
-    return b
+    return ""
 }
