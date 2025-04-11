@@ -64,3 +64,29 @@ roleRef:
   kind: ClusterRole
   name: external-controller-rclone
   apiGroup: rbac.authorization.k8s.io
+---
+# Add a Role for service management
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-nodeplugin-rclone-service-role
+  namespace: csi-rclone
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Add a RoleBinding to bind the role to the ServiceAccount
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-nodeplugin-rclone-service-binding
+  namespace: csi-rclone
+subjects:
+  - kind: ServiceAccount
+    name: csi-nodeplugin-rclone
+    namespace: csi-rclone
+roleRef:
+  kind: Role
+  name: csi-nodeplugin-rclone-service-role
+  apiGroup: rbac.authorization.k8s.io
