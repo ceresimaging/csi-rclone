@@ -388,6 +388,33 @@ func getFreePort() (port int, err error) {
 	return 0, err
 }
 
+// Function to generate a deterministic port number from pod UUID
+func getPortFromPodUUID(podUUID string) int {
+    // Hash the podUUID to a number in the range 30000-30999
+    var hash uint32 = 0
+    for _, c := range podUUID {
+        hash = (hash * 31) + uint32(c)
+    }
+    return 30000 + int(hash%1000) // Range 30000-30999
+}
+
+// Helper function to get the local IP address
+func getLocalIP() string {
+    addrs, err := net.InterfaceAddrs()
+    if err != nil {
+        return ""
+    }
+    for _, address := range addrs {
+        // Check the address type and if it's not a loopback
+        if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+            if ipnet.IP.To4() != nil {
+                return ipnet.IP.String()
+            }
+        }
+    }
+    return ""
+}
+
 // Mount routine.
 func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string) (rcPort int, err error) {
 	mountCmd := "rclone"
@@ -409,11 +436,17 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		glog.V(4).Infof("remote %s found in configData, remoteWithPath set to %s", remote, remoteWithPath)
 	}
 
-	// Find a free port for rclone rc
-	rcPort, err = getFreePort()
-	if err != nil {
-		return 0, err
-	}
+    // Extract pod UUID and generate deterministic port
+    podUUID := extractPodUUID(targetPath)
+    if podUUID == "" {
+        // Fall back to dynamic port if can't determine pod UUID
+        rcPort, err = getFreePort()
+        if err != nil {
+            return 0, err
+        }
+    } else {
+        rcPort = getPortFromPodUUID(podUUID)
+    }
 
 	// rclone mount remote:path /path/to/mountpoint [flags]
 	mountArgs = append(
@@ -519,28 +552,10 @@ func createRcloneService(targetPath string, port int) error {
         return err
     }
 
-    // Create the service resource
-    service := &v1.Service{
-        ObjectMeta: metav1.ObjectMeta{
-            Name: serviceName,
-            Labels: map[string]string{
-                "app": "csi-rclone",
-                "component": "mount-service",
-                "pod-uuid": podUUID,
-            },
-        },
-        Spec: v1.ServiceSpec{
-            Ports: []v1.ServicePort{
-                {
-                    Name: "rclone-rc",
-                    Port: int32(port),
-                    TargetPort: intstr.FromInt(port),
-                },
-            },
-            Selector: map[string]string{
-                "kubernetes.io/hostname": nodeName,
-            },
-        },
+    // Get local pod IP address
+    localIP := getLocalIP()
+    if localIP == "" {
+        return fmt.Errorf("could not determine local IP address")
     }
 
     kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
@@ -553,9 +568,75 @@ func createRcloneService(targetPath string, port int) error {
         return err
     }
 
+    // Create the service resource
+    service := &v1.Service{
+        ObjectMeta: metav1.ObjectMeta{
+            Name: serviceName,
+            Labels: map[string]string{
+                "app": "csi-rclone",
+                "component": "mount-service",
+                "pod-uuid": podUUID,
+            },
+        },
+        Spec: v1.ServiceSpec{
+            Type: v1.ServiceTypeClusterIP,
+            Ports: []v1.ServicePort{
+                {
+                    Name: "rclone-rc",
+                    Port: int32(port),
+                    TargetPort: intstr.FromInt(port),
+                },
+            },
+            // Do not set selector or ExternalIPs
+        },
+    }
+
+    // Create or update service
     _, err = clientset.CoreV1().Services(namespace).Create(service)
     if err != nil {
-        return err
+        if strings.Contains(err.Error(), "already exists") {
+            _, err = clientset.CoreV1().Services(namespace).Update(service)
+            if err != nil {
+                return err
+            }
+        } else {
+            return err
+        }
+    }
+
+    // Create endpoints to route traffic directly to the pod IP
+    endpoints := &v1.Endpoints{
+        ObjectMeta: metav1.ObjectMeta{
+            Name: serviceName,
+        },
+        Subsets: []v1.EndpointSubset{
+            {
+                Addresses: []v1.EndpointAddress{
+                    {
+                        IP: localIP,
+                    },
+                },
+                Ports: []v1.EndpointPort{
+                    {
+                        Name: "rclone-rc",
+                        Port: int32(port),
+                    },
+                },
+            },
+        },
+    }
+
+    // Create or update endpoints
+    _, err = clientset.CoreV1().Endpoints(namespace).Create(endpoints)
+    if err != nil {
+        if strings.Contains(err.Error(), "already exists") {
+            _, err = clientset.CoreV1().Endpoints(namespace).Update(endpoints)
+            if err != nil {
+                return err
+            }
+        } else {
+            return err
+        }
     }
 
     return nil
@@ -585,7 +666,19 @@ func deleteRcloneService(targetPath string) error {
         return err
     }
 
-    return clientset.CoreV1().Services(namespace).Delete(serviceName, &metav1.DeleteOptions{})
+    // Delete both the service and endpoints
+    svcErr := clientset.CoreV1().Services(namespace).Delete(serviceName, &metav1.DeleteOptions{})
+    epErr := clientset.CoreV1().Endpoints(namespace).Delete(serviceName, &metav1.DeleteOptions{})
+
+    // Return an error if either deletion fails
+    if svcErr != nil && !strings.Contains(svcErr.Error(), "not found") {
+        return svcErr
+    }
+    if epErr != nil && !strings.Contains(epErr.Error(), "not found") {
+        return epErr
+    }
+
+    return nil
 }
 
 // extractPodUUID extracts the Pod UUID from the target path
