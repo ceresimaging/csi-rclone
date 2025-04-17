@@ -388,7 +388,7 @@ func getPortFromPodUUID(podUUID string) int {
 	// Generate a deterministic but well-distributed hash
 	var hash uint32 = 0
 	for _, c := range podUUID {
-		hash = (hash * 31) + uint32(c)
+		hash = ((hash * 31) + uint32(c)) & 0xFFFFFFFF
 	}
 
 	return basePort + int(hash%(maxPort-basePort)) // Range 1024-65535
