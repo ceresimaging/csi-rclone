@@ -582,12 +582,6 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 }
 
 func createRcloneService(targetPath string, port int) error {
-	// Get the node name from environment
-	nodeName := os.Getenv("NODE_NAME")
-	if nodeName == "" {
-		return fmt.Errorf("NODE_NAME environment variable not set")
-	}
-
 	// Extract the Pod UUID from the path
 	// Path format: /var/lib/kubelet/pods/<UUID>/volumes/kubernetes.io~csi/<volume-name>/mount
 	podUUID := extractPodUUID(targetPath)
