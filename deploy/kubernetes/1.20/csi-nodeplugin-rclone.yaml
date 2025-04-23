@@ -51,7 +51,7 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: ghcr.io/ceresimaging/csi-rclone:v3.0.1
+          image: ghcr.io/ceresimaging/csi-rclone:v3.1-ceres
           args:
             - "/bin/csi-rclone-plugin"
             - "--nodeid=$(NODE_ID)"

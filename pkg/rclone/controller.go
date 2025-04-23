@@ -119,8 +119,8 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			if strings.HasPrefix(key, "csi-rclone/") {
 				key = strings.TrimPrefix(key, "csi-rclone/")
 
-				// Only allow some keys (umask, uid) to be passed to the volume context to avoid security issues
-				if key == "umask" {
+				// Only allow some keys (umask, uid, exposeRc) to be passed to the volume context to avoid security issues
+				if key == "umask" || key == "exposeRc" {
 					volumeContext[key] = value
 				}
 			}

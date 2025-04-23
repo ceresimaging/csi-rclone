@@ -21,6 +21,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume/util"
@@ -29,7 +30,8 @@ import (
 )
 
 type mountContext struct {
-	rcPort int
+	rcPort   int
+	exposeRc bool
 }
 
 type nodeServer struct {
@@ -110,13 +112,13 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// Load default connection settings from secret
 	secret, _ := getSecret("rclone-secret")
 
-	remote, remotePath, configData, flags, e := extractFlags(req.GetVolumeContext(), secret)
+	remote, remotePath, configData, flags, exposeRc, e := extractFlags(req.GetVolumeContext(), secret)
 	if e != nil {
 		glog.Warningf("storage parameter error: %s", e)
 		return nil, e
 	}
 
-	rcPort, e := Mount(remote, remotePath, targetPath, configData, flags)
+	rcPort, e := Mount(remote, remotePath, targetPath, configData, flags, exposeRc)
 	if e != nil {
 		if os.IsPermission(e) {
 			return nil, status.Error(codes.PermissionDenied, e.Error())
@@ -129,13 +131,14 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	// Save the mount context
 	ns.setMountContext(targetPath, &mountContext{
-		rcPort: rcPort,
+		rcPort:   rcPort,
+		exposeRc: exposeRc,
 	})
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, string, string, map[string]string, error) {
+func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, string, string, map[string]string, bool, error) {
 
 	// Empty argument list
 	flags := make(map[string]string)
@@ -157,8 +160,18 @@ func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, s
 		}
 	}
 
+	// Extract exposeRc flag, default to false if not specified
+	exposeRc := false
+	if val, ok := flags["exposeRc"]; ok {
+		exposeRcBool, err := strconv.ParseBool(val)
+		if err == nil {
+			exposeRc = exposeRcBool
+		}
+		delete(flags, "exposeRc")
+	}
+
 	if e := validateFlags(flags); e != nil {
-		return "", "", "", flags, e
+		return "", "", "", flags, exposeRc, e
 	}
 
 	remote := flags["remote"]
@@ -179,7 +192,7 @@ func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, s
 	delete(flags, "remote")
 	delete(flags, "remotePath")
 
-	return remote, remotePath, configData, flags, nil
+	return remote, remotePath, configData, flags, exposeRc, nil
 }
 
 // https://rclone.org/rc/#core-stats
@@ -240,8 +253,14 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	mountContext := ns.getMountContext(targetPath)
 	rcPort := mountContext.rcPort
+	exposeRc := mountContext.exposeRc
 
-	if rcPort != 0 {
+	if rcPort != 0 && exposeRc {
+		// Try to delete the service
+		if err := deleteRcloneService(targetPath); err != nil {
+			glog.Warningf("Failed to delete rclone service: %v", err)
+			// Continue even if service deletion fails
+		}
 		// Connect to rclone rpc server and query the operation status
 		// If the rclone process is still running, wait for it to finish cache sync
 		// If the rclone process is not running, proceed to volume unmount
@@ -369,6 +388,50 @@ func flagToEnvName(flag string) string {
 	return fmt.Sprintf("RCLONE_%s", flag)
 }
 
+// Function to generate a deterministic port number from pod UUID
+func getPortFromPodUUID(podUUID string) int {
+	const basePort = 1024
+	const maxPort = 65535
+	const rclonePort = 5572
+
+	serverPort := rclonePort
+
+	if podUUID != "" {
+		// Generate a deterministic but well-distributed hash
+		var hash uint32 = 0
+		for _, c := range podUUID {
+			hash = ((hash * 31) + uint32(c)) & 0xFFFFFFFF
+		}
+
+		// Calculate deterministic port in valid range
+		serverPort = basePort + int(hash%(maxPort-basePort))
+	}
+
+	// Check if the calculated port is available
+	if !isPortAvailable(serverPort) {
+		// If not available, use OS to assign a free port
+		freePort, err := getFreePort()
+		if err != nil {
+			glog.Warningf("Port %d isn't free, random port %d isn't free either, using default rclone port: %d", serverPort, freePort, rclonePort)
+			serverPort = rclonePort
+		} else {
+			serverPort = freePort
+		}
+	}
+
+	return serverPort
+}
+
+// isPortAvailable checks if a port is available for listening
+func isPortAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	ln.Close()
+	return true
+}
+
 // Credit: https://gist.github.com/sevkin/96bdae9274465b2d09191384f86ef39d
 func getFreePort() (port int, err error) {
 	var a *net.TCPAddr
@@ -382,8 +445,25 @@ func getFreePort() (port int, err error) {
 	return 0, err
 }
 
+// Helper function to get the local IP address
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, address := range addrs {
+		// Check the address type and if it's not a loopback
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return ""
+}
+
 // Mount routine.
-func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string) (rcPort int, err error) {
+func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string, exposeRc bool) (rcPort int, err error) {
 	mountCmd := "rclone"
 	mountArgs := []string{}
 
@@ -403,10 +483,16 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		glog.V(4).Infof("remote %s found in configData, remoteWithPath set to %s", remote, remoteWithPath)
 	}
 
-	// Find a free port for rclone rc
-	rcPort, err = getFreePort()
-	if err != nil {
-		return 0, err
+	// Extract pod UUID and generate deterministic port
+	podUUID := extractPodUUID(targetPath)
+	rcPort = getPortFromPodUUID(podUUID)
+
+	// Determine the RC listen address based on exposeRc flag
+	// If exposeRc is false, only listen on localhost for security
+	// If exposeRc is true, listen on all interfaces (0.0.0.0)
+	rcAddr := "localhost:" + strconv.Itoa(rcPort)
+	if exposeRc {
+		rcAddr = "0.0.0.0:" + strconv.Itoa(rcPort)
 	}
 
 	// rclone mount remote:path /path/to/mountpoint [flags]
@@ -416,7 +502,7 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		remoteWithPath,
 		targetPath,
 		"--rc",
-		"--rc-addr="+fmt.Sprintf("localhost:%d", rcPort),
+		"--rc-addr="+rcAddr,
 		"--daemon",
 		"--daemon-wait=0",
 	)
@@ -479,7 +565,176 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 	if err != nil {
 		return 0, fmt.Errorf("mounting failed: %v cmd: '%s' remote: '%s' targetpath: %s output: %q",
 			err, mountCmd, remoteWithPath, targetPath, string(out))
+	} else if exposeRc {
+		// Only create the service if exposeRc is true
+		glog.V(4).Infof("exposeRc is true, creating service for RC")
+		// Create a Kubernetes service to expose the rclone RC server
+		if err = createRcloneService(targetPath, rcPort); err != nil {
+			glog.Warningf("Failed to create service for rclone RC: %v", err)
+			// Continue even if service creation fails - it's not critical for mounting
+			// Clients will need to handle this case by not being able to access the rclone RC server
+		}
+	} else {
+		glog.V(4).Infof("exposeRc is false, skipping service creation for RC")
 	}
 
 	return rcPort, nil
+}
+
+func createRcloneService(targetPath string, port int) error {
+	// Extract the Pod UUID from the path
+	// Path format: /var/lib/kubelet/pods/<UUID>/volumes/kubernetes.io~csi/<volume-name>/mount
+	podUUID := extractPodUUID(targetPath)
+	if podUUID == "" {
+		return fmt.Errorf("could not extract Pod UUID from path: %s", targetPath)
+	}
+
+	serviceName := fmt.Sprintf("rclone-%s", podUUID)
+	// Ensure serviceName is valid
+	serviceName = strings.ToLower(serviceName)
+
+	clientset, err := GetK8sClient()
+	if err != nil {
+		return err
+	}
+
+	// Get local pod IP address
+	localIP := getLocalIP()
+	if localIP == "" {
+		return fmt.Errorf("could not determine local IP address")
+	}
+
+	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	)
+
+	namespace, _, err := kubeconfig.Namespace()
+	if err != nil {
+		return err
+	}
+
+	// Create the service resource
+	service := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: serviceName,
+			Labels: map[string]string{
+				"app":       "csi-rclone",
+				"component": "mount-service",
+				"pod-uuid":  podUUID,
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeClusterIP,
+			Ports: []v1.ServicePort{
+				{
+					Name:       "rclone-rc",
+					Port:       int32(port),
+					TargetPort: intstr.FromInt(port),
+				},
+			},
+			// Do not set selector or ExternalIPs
+		},
+	}
+
+	// Create or update service
+	_, err = clientset.CoreV1().Services(namespace).Create(service)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			_, err = clientset.CoreV1().Services(namespace).Update(service)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	// Create endpoints to route traffic directly to the pod IP
+	endpoints := &v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: serviceName,
+		},
+		Subsets: []v1.EndpointSubset{
+			{
+				Addresses: []v1.EndpointAddress{
+					{
+						IP: localIP,
+					},
+				},
+				Ports: []v1.EndpointPort{
+					{
+						Name: "rclone-rc",
+						Port: int32(port),
+					},
+				},
+			},
+		},
+	}
+
+	// Create or update endpoints
+	_, err = clientset.CoreV1().Endpoints(namespace).Create(endpoints)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			_, err = clientset.CoreV1().Endpoints(namespace).Update(endpoints)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func deleteRcloneService(targetPath string) error {
+	podUUID := extractPodUUID(targetPath)
+	if podUUID == "" {
+		return fmt.Errorf("could not extract Pod UUID from path: %s", targetPath)
+	}
+
+	serviceName := fmt.Sprintf("rclone-%s", podUUID)
+	serviceName = strings.ToLower(serviceName)
+
+	clientset, err := GetK8sClient()
+	if err != nil {
+		return err
+	}
+
+	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	)
+
+	namespace, _, err := kubeconfig.Namespace()
+	if err != nil {
+		return err
+	}
+
+	// Delete both the service and endpoints
+	svcErr := clientset.CoreV1().Services(namespace).Delete(serviceName, &metav1.DeleteOptions{})
+	epErr := clientset.CoreV1().Endpoints(namespace).Delete(serviceName, &metav1.DeleteOptions{})
+
+	// Return an error if either deletion fails
+	if svcErr != nil && !strings.Contains(svcErr.Error(), "not found") {
+		return svcErr
+	}
+	if epErr != nil && !strings.Contains(epErr.Error(), "not found") {
+		return epErr
+	}
+
+	return nil
+}
+
+// extractPodUUID extracts the Pod UUID from the target path
+func extractPodUUID(targetPath string) string {
+	// Path format: /var/lib/kubelet/pods/<UUID>/volumes/kubernetes.io~csi/<volume-name>/mount
+	parts := strings.Split(targetPath, "/")
+	for i, part := range parts {
+		if part == "pods" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }

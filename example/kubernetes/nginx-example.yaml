@@ -1,3 +1,4 @@
+# Example of Static Provisioning with Persistent Volumes using Rclone CSI Driver
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -9,7 +10,7 @@ spec:
   - ReadWriteMany
   capacity:
     storage: 10Gi
-  storageClassName: rclone
+  storageClassName: ""
   csi:
     driver: csi-rclone
     volumeHandle: data-id
@@ -20,6 +21,7 @@ spec:
       s3-endpoint: "http://minio.minio:9000"
       s3-access-key-id: "ACCESS_KEY_ID"
       s3-secret-access-key: "SECRET_ACCESS_KEY"
+      exposeRc: "true"  # This enables the rclone RC API
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -31,7 +33,7 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: rclone
+  storageClassName: ""
   selector:
     matchLabels:
       name: data-rclone-example
