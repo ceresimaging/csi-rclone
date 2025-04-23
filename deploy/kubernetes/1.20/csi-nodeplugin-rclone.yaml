@@ -62,10 +62,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: NODE_NAME
-              valueFrom:
-                  fieldRef:
-                    fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: unix://plugin/csi.sock
           imagePullPolicy: "Always"
