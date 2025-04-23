@@ -5,6 +5,7 @@ metadata:
   annotations:
     csi-rclone/storage-path: nginx
     csi-rclone/umask: "022"
+    csi-rclone/exposeRc: "true"  # This creates a K8s service exposing the rclone RC API
 spec:
   accessModes:
   - ReadWriteMany

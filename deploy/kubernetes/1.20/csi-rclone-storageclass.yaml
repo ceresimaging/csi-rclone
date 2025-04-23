@@ -8,4 +8,5 @@ volumeBindingMode: WaitForFirstConsumer
 # You will need to delete storageclass to update this field
 # provisioner: csi-rclone
 # parameters:
+#   exposeRc: "true"
 #   pathPattern: "${.PVC.namespace}/${.PVC.annotations.csi-rclone/storage-path}"

@@ -25,6 +25,8 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: data-rclone-example
+  annotations:
+    csi-rclone/exposeRc: "false" # Default value
 spec:
   accessModes:
   - ReadWriteMany

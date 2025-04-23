@@ -30,7 +30,8 @@ import (
 )
 
 type mountContext struct {
-	rcPort int
+	rcPort   int
+	exposeRc bool
 }
 
 type nodeServer struct {
@@ -111,13 +112,13 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// Load default connection settings from secret
 	secret, _ := getSecret("rclone-secret")
 
-	remote, remotePath, configData, flags, e := extractFlags(req.GetVolumeContext(), secret)
+	remote, remotePath, configData, flags, exposeRc, e := extractFlags(req.GetVolumeContext(), secret)
 	if e != nil {
 		glog.Warningf("storage parameter error: %s", e)
 		return nil, e
 	}
 
-	rcPort, e := Mount(remote, remotePath, targetPath, configData, flags)
+	rcPort, e := Mount(remote, remotePath, targetPath, configData, flags, exposeRc)
 	if e != nil {
 		if os.IsPermission(e) {
 			return nil, status.Error(codes.PermissionDenied, e.Error())
@@ -130,13 +131,14 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	// Save the mount context
 	ns.setMountContext(targetPath, &mountContext{
-		rcPort: rcPort,
+		rcPort:   rcPort,
+		exposeRc: exposeRc,
 	})
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, string, string, map[string]string, error) {
+func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, string, string, map[string]string, bool, error) {
 
 	// Empty argument list
 	flags := make(map[string]string)
@@ -158,8 +160,18 @@ func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, s
 		}
 	}
 
+	// Extract exposeRc flag, default to false if not specified
+	exposeRc := false
+	if val, ok := flags["exposeRc"]; ok {
+		exposeRcBool, err := strconv.ParseBool(val)
+		if err == nil {
+			exposeRc = exposeRcBool
+		}
+		delete(flags, "exposeRc")
+	}
+
 	if e := validateFlags(flags); e != nil {
-		return "", "", "", flags, e
+		return "", "", "", flags, exposeRc, e
 	}
 
 	remote := flags["remote"]
@@ -180,7 +192,7 @@ func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, s
 	delete(flags, "remote")
 	delete(flags, "remotePath")
 
-	return remote, remotePath, configData, flags, nil
+	return remote, remotePath, configData, flags, exposeRc, nil
 }
 
 // https://rclone.org/rc/#core-stats
@@ -241,8 +253,9 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	mountContext := ns.getMountContext(targetPath)
 	rcPort := mountContext.rcPort
+	exposeRc := mountContext.exposeRc
 
-	if rcPort != 0 {
+	if rcPort != 0 && exposeRc {
 		// Try to delete the service
 		if err := deleteRcloneService(targetPath); err != nil {
 			glog.Warningf("Failed to delete rclone service: %v", err)
@@ -378,20 +391,58 @@ func flagToEnvName(flag string) string {
 // Function to generate a deterministic port number from pod UUID
 func getPortFromPodUUID(podUUID string) int {
 	const basePort = 1024
-	const rclonePort = 5572 // Default port rclone RC server
 	const maxPort = 65535
+	const rclonePort = 5572
 
-	if podUUID == "" {
-		return rclonePort
+	serverPort := rclonePort
+
+	if podUUID != "" {
+		// Generate a deterministic but well-distributed hash
+		var hash uint32 = 0
+		for _, c := range podUUID {
+			hash = ((hash * 31) + uint32(c)) & 0xFFFFFFFF
+		}
+
+		// Calculate deterministic port in valid range
+		serverPort = basePort + int(hash%(maxPort-basePort))
 	}
 
-	// Generate a deterministic but well-distributed hash
-	var hash uint32 = 0
-	for _, c := range podUUID {
-		hash = ((hash * 31) + uint32(c)) & 0xFFFFFFFF
+	// Check if the calculated port is available
+	if !isPortAvailable(serverPort) {
+		// If not available, use OS to assign a free port
+		freePort, err := getFreePort()
+		if err != nil {
+			glog.Warningf("Port %d isn't free, random port %d isn't free either, using default rclone port: %d", serverPort, freePort, rclonePort)
+			serverPort = rclonePort
+		} else {
+			serverPort = freePort
+		}
 	}
 
-	return basePort + int(hash%(maxPort-basePort)) // Range 1024-65535
+	return serverPort
+}
+
+// isPortAvailable checks if a port is available for listening
+func isPortAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	ln.Close()
+	return true
+}
+
+// Credit: https://gist.github.com/sevkin/96bdae9274465b2d09191384f86ef39d
+func getFreePort() (port int, err error) {
+	var a *net.TCPAddr
+	if a, err = net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
+		var l *net.TCPListener
+		if l, err = net.ListenTCP("tcp", a); err == nil {
+			defer l.Close()
+			return l.Addr().(*net.TCPAddr).Port, nil
+		}
+	}
+	return 0, err
 }
 
 // Helper function to get the local IP address
@@ -412,7 +463,7 @@ func getLocalIP() string {
 }
 
 // Mount routine.
-func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string) (rcPort int, err error) {
+func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string, exposeRc bool) (rcPort int, err error) {
 	mountCmd := "rclone"
 	mountArgs := []string{}
 
@@ -436,6 +487,14 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 	podUUID := extractPodUUID(targetPath)
 	rcPort = getPortFromPodUUID(podUUID)
 
+	// Determine the RC listen address based on exposeRc flag
+	// If exposeRc is false, only listen on localhost for security
+	// If exposeRc is true, listen on all interfaces (0.0.0.0)
+	rcAddr := "localhost:" + strconv.Itoa(rcPort)
+	if exposeRc {
+		rcAddr = "0.0.0.0:" + strconv.Itoa(rcPort)
+	}
+
 	// rclone mount remote:path /path/to/mountpoint [flags]
 	mountArgs = append(
 		mountArgs,
@@ -443,7 +502,7 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		remoteWithPath,
 		targetPath,
 		"--rc",
-		"--rc-addr=0.0.0.0:"+strconv.Itoa(rcPort),
+		"--rc-addr="+rcAddr,
 		"--daemon",
 		"--daemon-wait=0",
 	)
@@ -506,13 +565,17 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 	if err != nil {
 		return 0, fmt.Errorf("mounting failed: %v cmd: '%s' remote: '%s' targetpath: %s output: %q",
 			err, mountCmd, remoteWithPath, targetPath, string(out))
-	} else {
+	} else if exposeRc {
+		// Only create the service if exposeRc is true
+		glog.V(4).Infof("exposeRc is true, creating service for RC")
 		// Create a Kubernetes service to expose the rclone RC server
 		if err = createRcloneService(targetPath, rcPort); err != nil {
 			glog.Warningf("Failed to create service for rclone RC: %v", err)
 			// Continue even if service creation fails - it's not critical for mounting
 			// Clients will need to handle this case by not being able to access the rclone RC server
 		}
+	} else {
+		glog.V(4).Infof("exposeRc is false, skipping service creation for RC")
 	}
 
 	return rcPort, nil
