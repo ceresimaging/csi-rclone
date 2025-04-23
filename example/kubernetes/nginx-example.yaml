@@ -20,13 +20,12 @@ spec:
       s3-endpoint: "http://minio.minio:9000"
       s3-access-key-id: "ACCESS_KEY_ID"
       s3-secret-access-key: "SECRET_ACCESS_KEY"
+      exposeRc: "true"  # This enables the rclone RC API
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: data-rclone-example
-  annotations:
-    csi-rclone/exposeRc: "false" # Default value
 spec:
   accessModes:
   - ReadWriteMany
