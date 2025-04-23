@@ -1,3 +1,4 @@
+# Example of Static Provisioning with Persistent Volumes using Rclone CSI Driver
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -9,7 +10,7 @@ spec:
   - ReadWriteMany
   capacity:
     storage: 10Gi
-  storageClassName: rclone
+  storageClassName: ""
   csi:
     driver: csi-rclone
     volumeHandle: data-id
@@ -32,7 +33,7 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: rclone
+  storageClassName: ""
   selector:
     matchLabels:
       name: data-rclone-example
