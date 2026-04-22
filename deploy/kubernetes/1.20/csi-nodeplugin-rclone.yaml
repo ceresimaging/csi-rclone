@@ -17,6 +17,11 @@ spec:
       serviceAccountName: csi-nodeplugin-rclone
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      # The rclone process serves every FUSE mount on the node; if this pod is
+      # evicted under node-pressure all mounts go "Transport endpoint is not
+      # connected" and only consumer-pod recreation heals them. Mark as
+      # node-critical so kubelet doesn't pick it as an eviction victim.
+      priorityClassName: system-node-critical
       containers:
         - name: node-driver-registrar
           image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.4.0
